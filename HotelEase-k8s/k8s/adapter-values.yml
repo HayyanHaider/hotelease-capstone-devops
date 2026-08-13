@@ -14,3 +14,12 @@ rules:
       matches: "http_requests_total"
       as: "http_requests_total"
     metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+  - seriesQuery: 'worker_jobs_processed_total{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "worker_jobs_processed_total"
+      as: "worker_jobs_processed_total"
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
