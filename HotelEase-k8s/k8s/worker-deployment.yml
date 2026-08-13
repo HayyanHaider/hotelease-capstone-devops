@@ -37,6 +37,9 @@ spec:
             secretKeyRef:
               name: backend-secret
               key: EMAIL_PASSWORD
+        ports:
+        - containerPort: 9091
+          name: metrics
         resources:
           requests:
             cpu: "100m"
