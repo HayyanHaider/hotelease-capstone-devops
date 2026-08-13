@@ -76,10 +76,10 @@ The original booking-cancellation flow sent confirmation emails inline, "fire an
 - Created `hpa-worker-custom.yml` — an HPA scaling the worker Deployment (1 → 5 replicas) based on the rate of jobs being processed
 - Verified end-to-end: wrote a small load-testing script (`flood-queue.js`) that pushes a burst of jobs directly onto the queue; watched the HPA react in real time, scaling the worker from 1 to 2 replicas as the processing rate climbed, then automatically scale back down to 1 once the queue drained and the cooldown window passed
 
-![Worker scaling under load](images/worker-hpa-scaling.png)
+![Worker scaling under load](HotelEase-k8s/images/worker-hpa-scaling.png) 
 *Worker Deployment scaling from 1 to 2 replicas in response to the custom `worker_jobs_processed_total` metric, then settling back to 1 as the queue drains.*
 
-![Worker metrics target in Prometheus](images/worker-prometheus-target.png)
+![Worker metrics target in Prometheus](HotelEase-k8s/images/worker-prometheus-target.png)
 *Prometheus successfully scraping the worker's `/metrics` endpoint via the ServiceMonitor.*
 
 ### Project structure additions
