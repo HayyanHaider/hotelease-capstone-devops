@@ -1,194 +1,137 @@
-# HotelEase — Kubernetes DevOps Project
+## Phase 7 — Task Queue, Background Worker, Process Management & Autoscaling (Capstone)
 
-A MERN-stack hotel booking app, containerized with Docker and deployed to a local Kubernetes cluster (kind), covering storage, config management, ingress routing, autoscaling (standard + custom-metric), and monitoring.
+Building on the Kubernetes deployment above, this phase adds asynchronous background job processing to the app — decoupling slow, non-critical work (sending emails) from the main API request/response cycle, and demonstrating horizontal scaling driven by real application load rather than just CPU.
 
-> Note: running this with plain `kubectl apply` on a single-node kind cluster behaves a lot like `docker-compose up` — one command brings up every service defined in the manifests. Kubernetes just adds self-healing, scaling, and service discovery on top.
+### Why
 
-## Tech Stack
-- Frontend: React (Vite) + Nginx
-- Backend: Node.js + Express
-- Database: MongoDB Atlas (real data) + in-cluster Mongo (storage practice)
-- File Storage: Cloudinary
-- Containerization: Docker
-- Orchestration: Kubernetes (kind — Kubernetes in Docker)
-- Ingress: NGINX Ingress Controller
-- Metrics: metrics-server (CPU/mem) + Prometheus + prom-client (custom app metrics)
-- Autoscaling: HPA — standard (CPU) and custom-metric (Prometheus Adapter)
-- Monitoring: Prometheus + Grafana
+The original booking-cancellation flow sent confirmation emails inline, "fire and forget," inside the same request that handled the cancellation. This worked, but had no reliability guarantees: if the server restarted at the wrong moment, an email could be silently lost with no retry and no record it was ever supposed to be sent. Moving this into a task queue adds persistence (jobs survive a crash), a foundation for retries, and — most importantly for this capstone — the ability to scale the workers that process these jobs independently of the main API.
 
-## Architecture
+### Architecture
 
 ```
-                        Browser
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │  Ingress (nginx) │
-                  │  /      /api     │
-                  └────┬─────────┬──┘
-                       │         │
-              ┌────────▼──┐  ┌───▼──────────┐
-              │ frontend-  │  │ backend      │
-              │ service    │  │ service      │
-              └────┬───────┘  └───┬──────────┘
-                   │              │
-              ┌────▼──────┐  ┌────▼────────────┐
-              │ frontend  │  │ backend         │
-              │ pod (nginx)│  │ pod (Express)   │
-              └───────────┘  │  /metrics ─┐    │
-                              └────────────┼────┘
-                                           │
-                    ┌──────────┬──────────┼─────────────┐
-                    ▼          ▼          ▼             ▼
-                 Secret   ConfigMap  MongoDB Atlas  Prometheus
-              (credentials)(settings)   (cloud)     (scrapes /metrics)
-                                                          │
-                                                          ▼
-                                                    Prometheus Adapter
-                                                          │
-                                                          ▼
-                                              Custom-metric HPA (backend)
-
-        Namespace: hotelease (everything above runs inside it)
+                     API request (cancel booking)
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │  backend (API)   │
+                    │  BookingService  │
+                    └────────┬─────────┘
+                             │  emailQueue.add(...)
+                             ▼
+                    ┌──────────────────┐
+                    │  Redis (Queue)   │
+                    │  BullMQ backend  │
+                    └────────┬─────────┘
+                             │  worker pulls jobs
+                             ▼
+                    ┌──────────────────┐
+                    │  worker pod(s)   │
+                    │  worker.js       │───▶ MongoDB (booking/user lookup)
+                    │  /metrics (9091) │───▶ Email service (send confirmation)
+                    └────────┬─────────┘
+                             │  scraped by
+                             ▼
+                    ┌──────────────────┐
+                    │   Prometheus     │
+                    └────────┬─────────┘
+                             │  worker_jobs_processed_total
+                             ▼
+                    ┌──────────────────┐
+                    │ Prometheus Adapter│
+                    └────────┬─────────┘
+                             │  custom metric
+                             ▼
+                    ┌──────────────────┐
+                    │  HPA (worker)    │  scales worker Deployment 1 → 5 replicas
+                    └──────────────────┘
 ```
 
-Separately, a `mongo-practice` Deployment + Service + PVC/PV exist purely to demonstrate storage concepts (ephemeral vs static PV vs dynamic PV) — not used by the real app, which connects to MongoDB Atlas.
+### What's been built
 
-## Project Structure
+**Task queue (Redis + BullMQ)**
+- Redis deployed both locally (Docker, for early development) and as a Kubernetes Deployment/Service inside the `hotelease` namespace
+- `queue.js` defines an `email-confirmation` BullMQ queue, with the Redis connection host/port configurable via environment variables (`REDIS_HOST`/`REDIS_PORT`) so the same code works identically whether running locally (`localhost`) or inside the cluster (`redis` — resolved via Kubernetes' internal DNS)
+- `BookingService.js`'s cancellation flow was refactored: instead of sending the confirmation email inline, it now pushes a job onto the queue and returns immediately
+
+**Background worker**
+- `worker.js` — a standalone Node.js process, separate from the main Express API, that listens to the queue and processes `cancellation-email` jobs: looks up the booking/user in MongoDB, builds the email, and sends it
+- Runs as its own Docker image (`Dockerfile.worker`), sharing the same codebase/dependencies as the backend but with a different entrypoint
+
+**Process management (PM2)**
+- The worker is managed by PM2 locally, giving it automatic restarts on crash and background execution without needing a dedicated terminal — demonstrating process-level resilience as a complement to Kubernetes' pod-level resilience
+
+**Kubernetes deployment**
+- `redis-deployment.yml` / `redis-service.yml` — Redis running as a first-class citizen of the cluster
+- `worker-deployment.yml` / `worker-service.yml` — the worker running as its own Deployment, connected to MongoDB Atlas, Redis, and email credentials via the existing `backend-secret`
+- Debugging note: connecting to Redis via `localhost` works when running the worker directly on a machine, but fails inside a container (`ECONNREFUSED`) since `localhost` inside a pod refers to the pod itself. Fixed by making the Redis host configurable and pointing it at the `redis` Service's DNS name inside the cluster.
+
+**Monitoring**
+- Installed the `kube-prometheus-stack` (Prometheus + Grafana + Alertmanager) via Helm into a dedicated `monitoring` namespace
+- Added `prom-client` to the worker, exposing a `worker_jobs_processed_total` counter (labeled by `completed`/`failed`) on a dedicated `/metrics` endpoint (port 9091), following the same pattern as the backend's existing metrics setup
+- Created a `ServiceMonitor` (`worker-servicemonitor.yml`) so Prometheus automatically discovers and scrapes the worker
+- Debugging note: a `ServiceMonitor`'s `selector` matches based on the target *Service's* labels, not the Service's pod-`selector` — the worker's Service initially had no labels of its own, so Prometheus couldn't find it despite scrapes technically being configured correctly. Fixed by adding `labels: app: worker` to the Service's metadata.
+
+**Custom-metric autoscaling**
+- Installed the Prometheus Adapter via Helm, extending the existing `adapter-values.yml` to also expose `worker_jobs_processed_total` as a Kubernetes custom metric (alongside the backend's existing `http_requests_total`)
+- Created `hpa-worker-custom.yml` — an HPA scaling the worker Deployment (1 → 5 replicas) based on the rate of jobs being processed
+- Verified end-to-end: wrote a small load-testing script (`flood-queue.js`) that pushes a burst of jobs directly onto the queue; watched the HPA react in real time, scaling the worker from 1 to 2 replicas as the processing rate climbed, then automatically scale back down to 1 once the queue drained and the cooldown window passed
+
+![Worker scaling under load](images/worker-hpa-scaling.png)
+*Worker Deployment scaling from 1 to 2 replicas in response to the custom `worker_jobs_processed_total` metric, then settling back to 1 as the queue drains.*
+
+![Worker metrics target in Prometheus](images/worker-prometheus-target.png)
+*Prometheus successfully scraping the worker's `/metrics` endpoint via the ServiceMonitor.*
+
+### Project structure additions
 
 ```
 HotelEase-k8s/
 ├── backend/
-│   └── Dockerfile
-├── frontend/
-│   └── Dockerfile
-├── images/                       (screenshots — see below)
+│   ├── queue.js                    (BullMQ queue definition, Redis connection)
+│   ├── worker.js                   (standalone background worker + /metrics endpoint)
+│   ├── flood-queue.js              (load-testing script for the scaling demo)
+│   └── Dockerfile.worker           (separate image for the worker process)
 ├── k8s/
-│   ├── namespace.yml
-│   ├── backend-deployment.yml
-│   ├── backend-service.yml
-│   ├── frontend-deployment.yml
-│   ├── frontend-service.yml
-│   ├── secret.yml                (gitignored — real credentials)
-│   ├── secret.example.yml        (template, safe to commit)
-│   ├── configmap.yml
-│   ├── mongo-deployment.yml
-│   ├── mongo-service.yml
-│   ├── mongo-pv.yml
-│   ├── mongo-pvc.yml
-│   ├── mongo-pvc-dynamic.yml
-│   ├── ingress.yml
-│   ├── hpa.yml                   (standard CPU-based HPA)
-│   └── hpa-custom-metric.yml     (Prometheus-based HPA)
-├── metrics-server-patch.yml      (kubelet-insecure-tls fix for kind)
-├── kind-config.yml
-└── docker-compose.yml            (legacy — pre-Kubernetes setup)
+│   ├── redis-deployment.yml
+│   ├── redis-service.yml
+│   ├── worker-deployment.yml
+│   ├── worker-service.yml
+│   ├── worker-servicemonitor.yml
+│   └── hpa-worker-custom.yml
 ```
 
-## What's been built
-
-### Phase 1 — Cluster setup + core deployments
-- Local `kind` cluster with port mappings (80/443) for Ingress
-- `hotelease` namespace
-- Backend Docker image built, loaded into cluster, deployed
-
-### Phase 2 — Storage
-- Practiced all three storage patterns on a throwaway Mongo pod:
-  - **Ephemeral** (`emptyDir`) — data lost on pod restart
-  - **Static PV/PVC** (hostPath) — manually created volume, survives restarts
-  - **Dynamic PV** — PVC requests storage from a StorageClass, PV auto-provisioned on first use (`WaitForFirstConsumer`)
-- Added an `emptyDir` volume to the backend for a temp cache folder
-
-### Phase 3 — Secrets + ConfigMaps
-- Secret for sensitive values (`MONGO_URI`, `JWT_SECRET`, `CLOUDINARY_API_SECRET`)
-- ConfigMap for non-sensitive config (`PORT`, `CLOUDINARY_CLOUD_NAME`, `FRONTEND_URL`)
-- Both injected into the backend two ways: env vars, and mounted volume
-- Confirmed backend connects to real MongoDB Atlas and Cloudinary using injected values
-
-### Phase 4 — Ingress + Ingress Controller
-- Installed NGINX Ingress Controller (kind-specific manifest)
-- Added `frontend-deployment.yml` / `frontend-service.yml` (frontend runs in-cluster from this phase on)
-- Added `backend-service.yml` for a stable backend name
-- Path-based routing: `/` → frontend, `/api` → backend
-
-**Debugging note:** the frontend's nginx config (baked in from the old Docker Compose setup) had a hardcoded reverse-proxy rule expecting an upstream host named exactly `backend`. Kubernetes resolves Services by exact name, so naming the Service `backend-service` caused an unresolvable-host crash (`CrashLoopBackOff`). Fixed by naming the Service `backend` instead of rebuilding the image. Also removed the Ingress `rewrite-target: /` annotation, since Express expects the full `/api/...` path.
-
-### Phase 5 — Metrics + standard autoscaling
-- Added CPU resource `requests`/`limits` to the backend Deployment
-- Installed `metrics-server` (with a kind-specific patch for `--kubelet-insecure-tls`, since kind's kubelet certs aren't signed for metrics-server's default trust)
-- Created a standard HPA — scales backend 1→4 replicas at 50% CPU target
-- Verified live scale-up and scale-down with `kubectl top` and load testing
-
-![HPA CPU scaling](images/hpa-cpu-scaling.png)
-*HPA reacting to CPU load, replica count scaling up in real time.*
-
-### Phase 6 — Custom-metric autoscaling with Prometheus
-- Added `prom-client` to the backend and exposed a `/metrics` endpoint (default Node.js metrics: CPU, memory, event loop lag, plus request counters)
-- Deployed Prometheus (scrapes the backend's `/metrics`) and Grafana (dashboards on top of Prometheus)
-- Deployed the Prometheus Adapter to expose a chosen Prometheus metric as a Kubernetes custom metric
-- Created a second HPA (`hpa-custom-metric.yml`) that scales the backend on that custom metric instead of CPU
-- Verified scaling behavior end-to-end, separate from the CPU-based HPA
-
-![Backend metrics endpoint](images/backend-metrics-endpoint.png)
-*Raw output of the backend's `/metrics` endpoint.*
-
-![Grafana dashboard](images/grafana-dashboard.png)
-*Grafana dashboard visualizing backend metrics scraped from Prometheus.*
-
-![HPA custom-metric scaling](images/hpa-custom-metric-scaling.png)
-*Custom-metric HPA scaling the backend based on the Prometheus metric instead of CPU.*
-
-## Environment Variables
-
-`backend` Secret (`k8s/secret.yml`, gitignored) / ConfigMap (`k8s/configmap.yml`):
-```
-MONGO_URI=
-JWT_SECRET=
-CLOUDINARY_API_SECRET=
-PORT=
-CLOUDINARY_CLOUD_NAME=
-FRONTEND_URL=
-```
-See `k8s/secret.example.yml` for the Secret template — encode real values with `echo -n "value" | base64` before use.
-
-## Run locally
+### Run locally (in addition to the setup above)
 
 ```bash
-git clone https://github.com/HayyanHaider/HotelEase-k8s.git
-cd HotelEase-k8s
+# Redis + worker manifests
+kubectl apply -f k8s/redis-deployment.yml
+kubectl apply -f k8s/redis-service.yml
 
-# create the cluster
-kind create cluster --name hotelease --config kind-config.yml
+# build + load the worker image
+docker build -f backend/Dockerfile.worker -t hotelease-worker:latest ./backend
+kind load docker-image hotelease-worker:latest --name hotelease
 
-# build + load images
-docker build -t hotelease-backend:v1 ./backend
-docker build -t hotelease-frontend:v1 ./frontend
-kind load docker-image hotelease-backend:v1 --name hotelease
-kind load docker-image hotelease-frontend:v1 --name hotelease
+kubectl apply -f k8s/worker-deployment.yml
+kubectl apply -f k8s/worker-service.yml
 
-# apply core manifests
-kubectl apply -f k8s/namespace.yml
-kubectl apply -f k8s/secret.yml       # copy from secret.example.yml first
-kubectl apply -f k8s/configmap.yml
-kubectl apply -f k8s/backend-deployment.yml
-kubectl apply -f k8s/backend-service.yml
-kubectl apply -f k8s/frontend-deployment.yml
-kubectl apply -f k8s/frontend-service.yml
+# monitoring stack (Prometheus + Grafana)
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring
 
-# ingress controller + routing
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
-kubectl apply -f k8s/ingress.yml
+kubectl apply -f k8s/worker-servicemonitor.yml
 
-# metrics + standard HPA
-kubectl apply -f metrics-server-patch.yml
-kubectl apply -f k8s/hpa.yml
+# Prometheus Adapter (exposes custom metrics to Kubernetes)
+helm install prometheus-adapter prometheus-community/prometheus-adapter -n monitoring -f k8s/adapter-values.yml
 
-# custom-metric HPA (after Prometheus + Adapter + Grafana are installed)
-kubectl apply -f k8s/hpa-custom-metric.yml
+# worker autoscaling
+kubectl apply -f k8s/hpa-worker-custom.yml
 ```
 
-App available at `http://localhost/`.
+### What this demonstrates
 
-## Legacy: Docker Compose deployment
-
-Before this Kubernetes-based setup, the project was deployed as plain Docker containers on an Azure VM via GitHub Actions CI/CD. That workflow (`docker-compose.yml`, `.github/workflows/deploy.yml`) is kept in the repo for reference but is no longer the primary deployment path.
+- Decoupling slow/unreliable work (email sending) from the main request/response cycle using a persistent task queue
+- Running a background worker as an independent, containerized process alongside a main API — same codebase, different entrypoint, deployed and scaled separately
+- Resilience at two layers: PM2 for process-level auto-restart, Kubernetes for pod-level auto-restart and replica management
+- Custom application metrics (not just CPU/memory) driving real autoscaling decisions — the same pattern used in production systems processing background jobs at scale (emails, image processing, video encoding, etc.)
