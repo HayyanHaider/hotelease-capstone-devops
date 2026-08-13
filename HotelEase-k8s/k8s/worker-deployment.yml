@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: hotelease
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+      - name: worker
+        image: hotelease-worker:latest
+        imagePullPolicy: Never
+        env:
+        - name: MONGO_URI
+          valueFrom:
+            secretKeyRef:
+              name: backend-secret
+              key: MONGO_URI
+        - name: REDIS_HOST
+          value: "redis"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: EMAIL_USER
+          valueFrom:
+            secretKeyRef:
+              name: backend-secret
+              key: EMAIL_USER
+        - name: EMAIL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: backend-secret
+              key: EMAIL_PASSWORD
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"

@@ -7,6 +7,7 @@ const CouponRepository = require('../repositories/CouponRepository');
 const UserRepository = require('../repositories/UserRepository');
 const Coupon = require('../classes/Coupon');
 const { sendEmail, emailTemplates } = require('../utils/emailService');
+const { emailQueue } = require('../queue');
 const { generateInvoicePDF } = require('../utils/pdfService');
 const { uploadInvoiceToCloudinary, hasCloudinaryConfig } = require('../utils/cloudinaryInvoiceService');
 const path = require('path');
@@ -397,9 +398,7 @@ class BookingService extends BaseService {
 
         await this.bookingRepository.deleteById(bookingId);
 
-        this.#sendCancellationEmail(bookingId, userId, null).catch(err => 
-          console.error('Error sending cancellation email:', err)
-        );
+        emailQueue.add('cancellation-email', { bookingId, userId, refundAmount: null });
 
         return { message: 'Pending booking removed successfully' };
       }
@@ -433,9 +432,7 @@ class BookingService extends BaseService {
         refundAmount: refundAmount
       });
 
-      this.#sendCancellationEmail(bookingId, userId, refundAmount).catch(err => 
-        console.error('Error sending cancellation email:', err)
-      );
+      emailQueue.add('cancellation-email', { bookingId, userId, refundAmount });
 
       return { message: 'Booking cancelled successfully' };
     } catch (error) {
